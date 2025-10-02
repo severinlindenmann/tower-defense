@@ -1,0 +1,262 @@
+import { useState, useEffect, useRef } from 'react'
+import './App.css'
+
+function App() {
+  const [playerId] = useState(() => Math.random().toString(36).substring(7))
+  const [ws, setWs] = useState(null)
+  const [gameState, setGameState] = useState(null)
+  const [connected, setConnected] = useState(false)
+  const [selectedTower, setSelectedTower] = useState('basic')
+  const canvasRef = useRef(null)
+  const animationRef = useRef(null)
+
+  // WebSocket connection
+  useEffect(() => {
+    const websocket = new WebSocket(`ws://localhost:8000/ws/${playerId}`)
+    
+    websocket.onopen = () => {
+      console.log('Connected to server')
+      setConnected(true)
+    }
+
+    websocket.onmessage = (event) => {
+      const message = JSON.parse(event.data)
+      console.log('Received:', message)
+      
+      if (message.game_state) {
+        setGameState(message.game_state)
+      }
+    }
+
+    websocket.onclose = () => {
+      console.log('Disconnected from server')
+      setConnected(false)
+    }
+
+    websocket.onerror = (error) => {
+      console.error('WebSocket error:', error)
+    }
+
+    setWs(websocket)
+
+    return () => {
+      websocket.close()
+    }
+  }, [playerId])
+
+  // Game rendering
+  useEffect(() => {
+    if (!gameState || !canvasRef.current) return
+
+    const canvas = canvasRef.current
+    const ctx = canvas.getContext('2d')
+
+    const render = () => {
+      // Clear canvas
+      ctx.fillStyle = '#2d5016'
+      ctx.fillRect(0, 0, canvas.width, canvas.height)
+
+      // Draw path
+      ctx.strokeStyle = '#8B4513'
+      ctx.lineWidth = 60
+      ctx.beginPath()
+      ctx.moveTo(0, 250)
+      ctx.lineTo(800, 250)
+      ctx.stroke()
+
+      // Draw towers
+      gameState.towers?.forEach(tower => {
+        ctx.fillStyle = tower.type === 'basic' ? '#4169E1' : 
+                        tower.type === 'fast' ? '#FFD700' : '#DC143C'
+        ctx.beginPath()
+        ctx.arc(tower.x, tower.y, 15, 0, Math.PI * 2)
+        ctx.fill()
+        
+        // Draw range indicator
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.2)'
+        ctx.lineWidth = 1
+        ctx.beginPath()
+        ctx.arc(tower.x, tower.y, tower.range, 0, Math.PI * 2)
+        ctx.stroke()
+      })
+
+      // Draw enemies
+      gameState.enemies?.forEach(enemy => {
+        // Update enemy position (simple animation)
+        enemy.x = (enemy.x || 0) + 1
+        
+        ctx.fillStyle = '#FF0000'
+        ctx.beginPath()
+        ctx.arc(enemy.x, enemy.y, 10, 0, Math.PI * 2)
+        ctx.fill()
+        
+        // Health bar
+        ctx.fillStyle = '#00FF00'
+        ctx.fillRect(enemy.x - 15, enemy.y - 20, 30 * (enemy.health / 100), 5)
+        ctx.strokeStyle = '#000'
+        ctx.strokeRect(enemy.x - 15, enemy.y - 20, 30, 5)
+      })
+
+      // Check for enemies reaching the end
+      gameState.enemies?.forEach(enemy => {
+        if (enemy.x > 800 && ws) {
+          ws.send(JSON.stringify({
+            type: 'enemy_reached_end',
+            enemy_id: enemy.id
+          }))
+        }
+      })
+
+      // Simple tower attack logic
+      gameState.towers?.forEach(tower => {
+        gameState.enemies?.forEach(enemy => {
+          const dx = enemy.x - tower.x
+          const dy = enemy.y - tower.y
+          const distance = Math.sqrt(dx * dx + dy * dy)
+          
+          if (distance < tower.range && enemy.health > 0) {
+            // Draw attack line
+            ctx.strokeStyle = 'rgba(255, 255, 0, 0.5)'
+            ctx.lineWidth = 2
+            ctx.beginPath()
+            ctx.moveTo(tower.x, tower.y)
+            ctx.lineTo(enemy.x, enemy.y)
+            ctx.stroke()
+            
+            // Damage enemy
+            enemy.health -= 0.5
+            if (enemy.health <= 0 && ws) {
+              ws.send(JSON.stringify({
+                type: 'enemy_destroyed',
+                enemy_id: enemy.id
+              }))
+            }
+          }
+        })
+      })
+
+      animationRef.current = requestAnimationFrame(render)
+    }
+
+    render()
+
+    return () => {
+      if (animationRef.current) {
+        cancelAnimationFrame(animationRef.current)
+      }
+    }
+  }, [gameState, ws])
+
+  const handleCanvasClick = (e) => {
+    if (!ws || !connected) return
+
+    const rect = canvasRef.current.getBoundingClientRect()
+    const x = e.clientX - rect.left
+    const y = e.clientY - rect.top
+
+    ws.send(JSON.stringify({
+      type: 'place_tower',
+      x: Math.round(x),
+      y: Math.round(y),
+      tower_type: selectedTower
+    }))
+  }
+
+  const startGame = () => {
+    if (ws && connected) {
+      ws.send(JSON.stringify({ type: 'start_game' }))
+    }
+  }
+
+  const spawnWave = () => {
+    if (ws && connected) {
+      ws.send(JSON.stringify({ type: 'spawn_wave' }))
+    }
+  }
+
+  const currentPlayer = gameState?.players?.[playerId]
+
+  return (
+    <div className="app">
+      <header className="header">
+        <h1>🏰 Multiplayer Tower Defense</h1>
+        <div className="connection-status">
+          {connected ? '🟢 Connected' : '🔴 Disconnected'}
+        </div>
+      </header>
+
+      <div className="game-container">
+        <aside className="sidebar">
+          <div className="player-info">
+            <h2>Your Stats</h2>
+            {currentPlayer && (
+              <>
+                <p>💰 Gold: {currentPlayer.gold}</p>
+                <p>❤️ Lives: {currentPlayer.lives}</p>
+                <p>⭐ Score: {currentPlayer.score}</p>
+              </>
+            )}
+          </div>
+
+          <div className="tower-selection">
+            <h3>Select Tower</h3>
+            <button 
+              className={selectedTower === 'basic' ? 'selected' : ''}
+              onClick={() => setSelectedTower('basic')}
+            >
+              🔵 Basic (100g)
+            </button>
+            <button 
+              className={selectedTower === 'fast' ? 'selected' : ''}
+              onClick={() => setSelectedTower('fast')}
+            >
+              🟡 Fast (150g)
+            </button>
+            <button 
+              className={selectedTower === 'heavy' ? 'selected' : ''}
+              onClick={() => setSelectedTower('heavy')}
+            >
+              🔴 Heavy (200g)
+            </button>
+          </div>
+
+          <div className="game-controls">
+            <h3>Game Controls</h3>
+            <button onClick={startGame} disabled={!connected || gameState?.game_started}>
+              Start Game
+            </button>
+            <button onClick={spawnWave} disabled={!connected || !gameState?.game_started}>
+              Spawn Wave {gameState?.wave_number ? `(${gameState.wave_number + 1})` : '(1)'}
+            </button>
+          </div>
+
+          <div className="players-list">
+            <h3>Players ({Object.keys(gameState?.players || {}).length})</h3>
+            {Object.values(gameState?.players || {}).map(player => (
+              <div key={player.id} className="player-item">
+                <strong>{player.name}</strong>
+                <small>{player.id === playerId ? '(You)' : ''}</small>
+                <div>💰 {player.gold} | ❤️ {player.lives}</div>
+              </div>
+            ))}
+          </div>
+        </aside>
+
+        <main className="game-area">
+          <canvas
+            ref={canvasRef}
+            width={800}
+            height={500}
+            onClick={handleCanvasClick}
+          />
+          <div className="game-info">
+            <p>Click on the canvas to place towers!</p>
+            <p>Enemies: {gameState?.enemies?.length || 0} | Towers: {gameState?.towers?.length || 0}</p>
+          </div>
+        </main>
+      </div>
+    </div>
+  )
+}
+
+export default App

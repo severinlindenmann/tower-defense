@@ -1,0 +1,280 @@
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from typing import Dict, List, Set
+import json
+import random
+from datetime import datetime
+
+app = FastAPI(title="Tower Defense Game API")
+
+# Enable CORS for React frontend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://localhost:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+class GameState:
+    def __init__(self):
+        self.players: Dict[str, dict] = {}
+        self.enemies: List[dict] = []
+        self.towers: List[dict] = []
+        self.game_started = False
+        self.wave_number = 0
+        self.enemy_id_counter = 0
+        self.tower_id_counter = 0
+        self.player_colors = [
+            "#FF6B6B", "#4ECDC4", "#45B7D1", "#FFA07A", 
+            "#98D8C8", "#F7DC6F", "#BB8FCE", "#85C1E2"
+        ]
+        self.used_colors = set()
+
+    def get_player_color(self, player_id: str) -> str:
+        """Assign a unique color to a player"""
+        if player_id in self.players and "color" in self.players[player_id]:
+            return self.players[player_id]["color"]
+        
+        # Find an unused color
+        available_colors = [c for c in self.player_colors if c not in self.used_colors]
+        if not available_colors:
+            # If all colors used, generate a random one
+            import random
+            color = "#{:06x}".format(random.randint(0, 0xFFFFFF))
+        else:
+            color = available_colors[0]
+        
+        self.used_colors.add(color)
+        return color
+
+    def add_player(self, player_id: str, name: str):
+        color = self.get_player_color(player_id)
+        self.players[player_id] = {
+            "id": player_id,
+            "name": name,
+            "gold": 500,
+            "lives": 20,
+            "score": 0,
+            "color": color,
+        }
+
+    def remove_player(self, player_id: str):
+        if player_id in self.players:
+            # Free up the color
+            if "color" in self.players[player_id]:
+                self.used_colors.discard(self.players[player_id]["color"])
+            del self.players[player_id]
+
+    def place_tower(self, player_id: str, x: int, y: int, tower_type: str):
+        tower_cost = {"basic": 100, "fast": 150, "heavy": 200}
+        cost = tower_cost.get(tower_type, 100)
+
+        # Check if player exists
+        if player_id not in self.players:
+            return None
+
+        if self.players[player_id]["gold"] >= cost:
+            self.players[player_id]["gold"] -= cost
+            self.tower_id_counter += 1
+            tower = {
+                "id": self.tower_id_counter,
+                "x": x,
+                "y": y,
+                "type": tower_type,
+                "owner": player_id,
+                "owner_color": self.players[player_id]["color"],
+                "damage": 10 if tower_type == "basic" else (5 if tower_type == "fast" else 25),
+                "range": 100,
+                "fire_rate": 0.5 if tower_type == "fast" else (0.3 if tower_type == "basic" else 0.2),
+            }
+            self.towers.append(tower)
+            return tower
+        return None
+
+    def spawn_enemy(self):
+        self.enemy_id_counter += 1
+        enemy = {
+            "id": self.enemy_id_counter,
+            "x": 0,
+            "y": 250,
+            "health": 50 + (self.wave_number * 10),
+            "max_health": 50 + (self.wave_number * 10),
+            "speed": 1 + (self.wave_number * 0.1),
+            "reward": 25 + (self.wave_number * 5),
+        }
+        self.enemies.append(enemy)
+        return enemy
+
+    def get_state(self):
+        return {
+            "players": self.players,
+            "enemies": self.enemies,
+            "towers": self.towers,
+            "game_started": self.game_started,
+            "wave_number": self.wave_number,
+        }
+
+
+# Global game state
+game_state = GameState()
+
+# Active WebSocket connections
+active_connections: Set[WebSocket] = set()
+
+
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: List[WebSocket] = []
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+
+    def disconnect(self, websocket: WebSocket):
+        self.active_connections.remove(websocket)
+
+    async def broadcast(self, message: dict):
+        for connection in self.active_connections:
+            try:
+                await connection.send_json(message)
+            except Exception:
+                pass
+
+
+manager = ConnectionManager()
+
+
+@app.get("/")
+async def root():
+    return {
+        "message": "Tower Defense Game API",
+        "version": "0.1.0",
+        "endpoints": {
+            "websocket": "/ws/{player_id}",
+            "health": "/health",
+        },
+    }
+
+
+@app.get("/health")
+async def health():
+    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
+
+
+@app.websocket("/ws/{player_id}")
+async def websocket_endpoint(websocket: WebSocket, player_id: str):
+    await manager.connect(websocket)
+    
+    # Add player to game
+    player_name = f"Player_{player_id[:4]}"
+    game_state.add_player(player_id, player_name)
+    
+    # Broadcast new player joined
+    await manager.broadcast({
+        "type": "player_joined",
+        "player_id": player_id,
+        "player_name": player_name,
+        "game_state": game_state.get_state(),
+    })
+
+    try:
+        while True:
+            data = await websocket.receive_text()
+            message = json.loads(data)
+            message_type = message.get("type")
+
+            if message_type == "place_tower":
+                tower = game_state.place_tower(
+                    player_id,
+                    message["x"],
+                    message["y"],
+                    message["tower_type"]
+                )
+                if tower:
+                    await manager.broadcast({
+                        "type": "tower_placed",
+                        "tower": tower,
+                        "game_state": game_state.get_state(),
+                    })
+
+            elif message_type == "start_game":
+                if not game_state.game_started:
+                    game_state.game_started = True
+                    await manager.broadcast({
+                        "type": "game_started",
+                        "game_state": game_state.get_state(),
+                    })
+
+            elif message_type == "spawn_wave":
+                game_state.wave_number += 1
+                enemies_to_spawn = 5 + game_state.wave_number
+                spawned = []
+                for _ in range(enemies_to_spawn):
+                    enemy = game_state.spawn_enemy()
+                    spawned.append(enemy)
+                
+                await manager.broadcast({
+                    "type": "wave_spawned",
+                    "wave_number": game_state.wave_number,
+                    "enemies": spawned,
+                    "game_state": game_state.get_state(),
+                })
+
+            elif message_type == "enemy_destroyed":
+                enemy_id = message["enemy_id"]
+                tower_owner_id = message.get("tower_owner_id")
+                
+                # Find the enemy to get reward value
+                enemy = next((e for e in game_state.enemies if e["id"] == enemy_id), None)
+                if enemy:
+                    reward = enemy.get("reward", 25)
+                    game_state.enemies = [e for e in game_state.enemies if e["id"] != enemy_id]
+                    
+                    # Reward only the tower owner
+                    if tower_owner_id and tower_owner_id in game_state.players:
+                        game_state.players[tower_owner_id]["gold"] += reward
+                        game_state.players[tower_owner_id]["score"] += reward
+                    
+                    await manager.broadcast({
+                        "type": "enemy_destroyed",
+                        "enemy_id": enemy_id,
+                        "tower_owner_id": tower_owner_id,
+                        "reward": reward,
+                        "game_state": game_state.get_state(),
+                    })
+
+            elif message_type == "enemy_reached_end":
+                enemy_id = message["enemy_id"]
+                game_state.enemies = [e for e in game_state.enemies if e["id"] != enemy_id]
+                
+                # All players lose a life
+                for p in game_state.players.values():
+                    p["lives"] -= 1
+                
+                await manager.broadcast({
+                    "type": "enemy_reached_end",
+                    "enemy_id": enemy_id,
+                    "game_state": game_state.get_state(),
+                })
+
+            elif message_type == "get_state":
+                await websocket.send_json({
+                    "type": "state_update",
+                    "game_state": game_state.get_state(),
+                })
+
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+        game_state.remove_player(player_id)
+        await manager.broadcast({
+            "type": "player_left",
+            "player_id": player_id,
+            "game_state": game_state.get_state(),
+        })
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
