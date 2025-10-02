@@ -1,0 +1,103 @@
+.tower-menu {
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  border-radius: 12px;
+  padding: 15px;
+  margin-bottom: 15px;
+  box-shadow: 0 4px 6px rgba(0, 0, 0, 0.2);
+}
+
+.tower-menu h3 {
+  margin: 0 0 15px 0;
+  color: white;
+  font-size: 1.2em;
+  text-align: center;
+}
+
+.tower-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 10px;
+  margin-bottom: 15px;
+}
+
+.tower-card {
+  background: white;
+  border-radius: 8px;
+  padding: 12px;
+  cursor: pointer;
+  transition: all 0.2s;
+  border: 2px solid transparent;
+}
+
+.tower-card:hover:not(.disabled) {
+  transform: translateY(-2px);
+  box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2);
+}
+
+.tower-card.selected {
+  border-color: #FFD700;
+  background: #FFFACD;
+}
+
+.tower-card.disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.tower-icon {
+  font-size: 2em;
+  text-align: center;
+  margin-bottom: 5px;
+}
+
+.tower-name {
+  font-weight: bold;
+  font-size: 0.9em;
+  text-align: center;
+  margin-bottom: 5px;
+}
+
+.tower-cost {
+  text-align: center;
+  color: #2ecc71;
+  font-weight: bold;
+  margin-bottom: 5px;
+}
+
+.tower-stats {
+  display: flex;
+  justify-content: space-around;
+  font-size: 0.8em;
+  margin-bottom: 5px;
+  color: #555;
+}
+
+.tower-description {
+  font-size: 0.7em;
+  color: #666;
+  text-align: center;
+  line-height: 1.2;
+}
+
+.tower-legend {
+  background: rgba(255, 255, 255, 0.2);
+  border-radius: 6px;
+  padding: 10px;
+  color: white;
+}
+
+.tower-legend h4 {
+  margin: 0 0 8px 0;
+  font-size: 0.9em;
+}
+
+.tower-legend p {
+  margin: 4px 0;
+  font-size: 0.8em;
+}
+
+@media (max-width: 768px) {
+  .tower-grid {
+    grid-template-columns: 1fr;
+  }
+}

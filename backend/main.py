@@ -2,10 +2,9 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 import asyncio
 import json
-import time
 import logging
 from typing import Dict
-from game_state import GameState
+from models.game import Game
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -13,203 +12,199 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-# CORS middleware - Allow both ports
+# CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:5174"],
+    allow_origins=["http://localhost:5173", "http://localhost:5174", "http://localhost:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Global game state
-game_state = GameState()
+# Global game instance
+game = Game()
 
-# Connection manager
+# WebSocket connection manager
 class ConnectionManager:
     def __init__(self):
         self.active_connections: Dict[str, WebSocket] = {}
 
-    async def connect(self, client_id: str, websocket: WebSocket):
+    async def connect(self, player_id: str, websocket: WebSocket):
         await websocket.accept()
-        self.active_connections[client_id] = websocket
+        self.active_connections[player_id] = websocket
+        logger.info(f"Player {player_id} connected. Total players: {len(self.active_connections)}")
 
-    def disconnect(self, client_id: str):
-        if client_id in self.active_connections:
-            del self.active_connections[client_id]
+    def disconnect(self, player_id: str):
+        if player_id in self.active_connections:
+            del self.active_connections[player_id]
+            logger.info(f"Player {player_id} disconnected. Total players: {len(self.active_connections)}")
 
-    async def broadcast(self, message: str):
-        disconnected = []
-        for client_id, connection in self.active_connections.items():
+    async def send_to_player(self, player_id: str, message: dict):
+        if player_id in self.active_connections:
             try:
-                await connection.send_text(message)
-            except Exception:
-                disconnected.append(client_id)
+                await self.active_connections[player_id].send_json(message)
+            except Exception as e:
+                logger.error(f"Error sending to {player_id}: {e}")
+                self.disconnect(player_id)
+
+    async def broadcast(self, message: dict):
+        """Broadcast message to all connected players"""
+        disconnected = []
+        for player_id, connection in self.active_connections.items():
+            try:
+                await connection.send_json(message)
+            except Exception as e:
+                logger.error(f"Error broadcasting to {player_id}: {e}")
+                disconnected.append(player_id)
         
-        for client_id in disconnected:
-            self.disconnect(client_id)
+        for player_id in disconnected:
+            self.disconnect(player_id)
 
 manager = ConnectionManager()
 
-# Game loop
-async def game_loop():
-    """Main game loop that runs continuously"""
-    while True:
-        await asyncio.sleep(0.1)  # 10 FPS tick rate
-        
-        current_time = time.time()
-        
-        # Update towers - check for targets and shoot
-        for tower in game_state.towers:
-            if current_time - tower.last_fire >= tower.fire_rate:
-                # Find closest enemy in range
-                closest_enemy = None
-                min_distance = float('inf')
-                
-                for enemy in game_state.enemies:
-                    if tower.tower_type == "sniper" and not enemy.is_flying:
-                        continue  # Sniper only targets flying enemies
-                    
-                    dx = enemy.x - tower.x
-                    dy = enemy.y - tower.y
-                    distance = (dx * dx + dy * dy) ** 0.5
-                    
-                    if distance <= tower.range and distance < min_distance:
-                        min_distance = distance
-                        closest_enemy = enemy
-                
-                # Shoot at closest enemy
-                if closest_enemy:
-                    tower.last_fire = current_time
-                    
-                    if tower.tower_type == "splash":
-                        # Splash damage to all enemies in radius
-                        for enemy in game_state.enemies:
-                            dx = enemy.x - closest_enemy.x
-                            dy = enemy.y - closest_enemy.y
-                            distance = (dx * dx + dy * dy) ** 0.5
-                            if distance <= tower.splash_radius:
-                                enemy.take_damage(tower.damage)
-                    elif tower.tower_type == "freeze":
-                        # Slow enemy and damage
-                        closest_enemy.take_damage(tower.damage)
-                        closest_enemy.slowed = True
-                        closest_enemy.slow_duration = current_time + 2.0  # 2 second slow
-                    else:
-                        closest_enemy.take_damage(tower.damage)
-                    
-                    # Check if enemy died
-                    if closest_enemy.hp <= 0:
-                        game_state.destroy_enemy(closest_enemy.enemy_id, tower.owner_id)
-        
-        # Update enemies - move along path
-        for enemy in game_state.enemies:
-            # Check slow duration
-            speed_modifier = 1.0
-            if hasattr(enemy, 'slowed') and enemy.slowed:
-                if hasattr(enemy, 'slow_duration') and current_time < enemy.slow_duration:
-                    speed_modifier = 0.5
-                else:
-                    enemy.slowed = False
-            
-            # Move enemy
-            if enemy.path_index < len(enemy.path):
-                target = enemy.path[enemy.path_index]
-                dx = target[0] - enemy.x
-                dy = target[1] - enemy.y
-                distance = (dx * dx + dy * dy) ** 0.5
-                
-                if distance < enemy.speed * speed_modifier:
-                    enemy.path_index += 1
-                    if enemy.path_index >= len(enemy.path):
-                        # Enemy reached the end
-                        for player in game_state.players.values():
-                            player.lose_life()
-                        game_state.enemies.remove(enemy)
-                else:
-                    enemy.x += (dx / distance) * enemy.speed * speed_modifier
-                    enemy.y += (dy / distance) * enemy.speed * speed_modifier
-        
-        # Healer enemy special ability
-        for enemy in game_state.enemies:
-            if enemy.enemy_type == "healer" and current_time - getattr(enemy, 'last_heal', 0) >= 3.0:
-                enemy.last_heal = current_time
-                # Heal nearby enemies
-                for other in game_state.enemies:
-                    if other.enemy_id != enemy.enemy_id:
-                        dx = other.x - enemy.x
-                        dy = other.y - enemy.y
-                        distance = (dx * dx + dy * dy) ** 0.5
-                        if distance <= 100:
-                            other.hp = min(other.hp + 20, other.max_hp)
-        
-        # Check if wave should spawn
-        if len(game_state.enemies) == 0:
-            game_state.spawn_wave()
-        
-        # Broadcast game state
-        state = game_state.get_state()
-        await manager.broadcast(json.dumps(state))
-
-@app.on_event("startup")
-async def startup_event():
-    """Start the game loop when the app starts"""
-    asyncio.create_task(game_loop())
 
 @app.get("/")
 async def root():
-    return {"message": "Tower Defense Backend"}
+    return {
+        "message": "Tower Defense Game API",
+        "players": len(game.players),
+        "towers": len(game.towers),
+        "enemies": len(game.enemies),
+        "wave": game.current_wave
+    }
 
-@app.websocket("/ws/{client_id}")
-async def websocket_endpoint(websocket: WebSocket, client_id: str):
-    logger.info(f"🔌 Client {client_id} attempting to connect")
-    await manager.connect(client_id, websocket)
+
+@app.websocket("/ws/{player_id}")
+async def websocket_endpoint(websocket: WebSocket, player_id: str):
+    await manager.connect(player_id, websocket)
     
     # Add player to game
-    player_name = f"Player {len(game_state.players) + 1}"
-    game_state.add_player(client_id, player_name)
-    logger.info(f"✅ Player added: {player_name} (ID: {client_id})")
-    logger.info(f"📊 Total players: {len(game_state.players)}")
+    game.add_player(player_id)
     
-    # Send initial state
-    state = game_state.get_state()
-    logger.info(f"📤 Sending initial state to {client_id}: {len(state.get('players', []))} players")
-    await websocket.send_text(json.dumps(state))
+    # Send initial game state
+    await manager.send_to_player(player_id, {
+        "type": "init",
+        "state": game.to_dict()
+    })
     
     try:
         while True:
+            # Receive messages from client
             data = await websocket.receive_text()
             message = json.loads(data)
-            logger.info(f"📨 Received message from {client_id}: {message.get('type')}")
             
-            if message["type"] == "place_tower":
-                tower_type = message.get("tower_type", "basic")
-                x, y = message["x"], message["y"]
-                logger.info(f"🏰 {client_id} placing {tower_type} tower at ({x}, {y})")
-                
-                success = game_state.place_tower(
-                    client_id,
-                    x,
-                    y,
-                    tower_type
-                )
-                
-                if success:
-                    logger.info(f"✅ Tower placed successfully!")
-                else:
-                    logger.warning(f"❌ Tower placement failed!")
-                    await websocket.send_text(json.dumps({
-                        "type": "error",
-                        "message": "Cannot place tower there or not enough gold"
-                    }))
+            response = await handle_player_action(player_id, message)
             
-            elif message["type"] == "start_wave":
-                logger.info(f"🌊 Starting wave {game_state.wave_number + 1}")
-                game_state.spawn_wave()
+            # Broadcast state update to all players
+            if response.get("broadcast", True):
+                await manager.broadcast({
+                    "type": "state_update",
+                    "state": game.to_dict(),
+                    "events": response.get("events", {})
+                })
+            else:
+                # Send response only to requesting player
+                await manager.send_to_player(player_id, response)
     
     except WebSocketDisconnect:
-        manager.disconnect(client_id)
-        logger.info(f"🔌 Client {client_id} disconnected")
+        manager.disconnect(player_id)
+        game.remove_player(player_id)
+        await manager.broadcast({
+            "type": "player_disconnected",
+            "player_id": player_id,
+            "state": game.to_dict()
+        })
     except Exception as e:
-        logger.error(f"❌ Error in websocket for {client_id}: {e}")
-        manager.disconnect(client_id)
+        logger.error(f"WebSocket error for {player_id}: {e}")
+        manager.disconnect(player_id)
+        game.remove_player(player_id)
+
+
+async def handle_player_action(player_id: str, message: dict) -> dict:
+    """Handle player actions"""
+    action = message.get("action")
+    
+    if action == "place_tower":
+        result = game.place_tower(
+            player_id,
+            message.get("x"),
+            message.get("y"),
+            message.get("tower_type")
+        )
+        return {
+            "type": "tower_placed",
+            "result": result,
+            "broadcast": result.get("success", False)
+        }
+    
+    elif action == "upgrade_tower":
+        result = game.upgrade_tower(
+            player_id,
+            message.get("tower_id"),
+            message.get("upgrade_path", "damage")
+        )
+        return {
+            "type": "tower_upgraded",
+            "result": result,
+            "broadcast": result.get("success", False)
+        }
+    
+    elif action == "start_wave":
+        if not game.game_started:
+            game.start_game()
+        else:
+            game.start_next_wave()
+        return {
+            "type": "wave_started",
+            "result": {"success": True, "wave": game.current_wave},
+            "broadcast": True
+        }
+    
+    elif action == "get_state":
+        return {
+            "type": "state",
+            "state": game.to_dict(),
+            "broadcast": False
+        }
+    
+    return {
+        "type": "error",
+        "error": f"Unknown action: {action}",
+        "broadcast": False
+    }
+
+
+# Background task for game updates
+@app.on_event("startup")
+async def startup_event():
+    """Start background game loop"""
+    asyncio.create_task(game_loop())
+
+
+async def game_loop():
+    """Main game loop that updates game state"""
+    logger.info("Game loop started")
+    
+    while True:
+        try:
+            # Update game state
+            game.update()
+            
+            # Broadcast updates if game is running
+            if game.game_started and manager.active_connections:
+                await manager.broadcast({
+                    "type": "game_update",
+                    "state": game.to_dict()
+                })
+            
+            # Sleep for 100ms (10 ticks per second)
+            await asyncio.sleep(0.1)
+        
+        except Exception as e:
+            logger.error(f"Error in game loop: {e}")
+            await asyncio.sleep(1)
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
